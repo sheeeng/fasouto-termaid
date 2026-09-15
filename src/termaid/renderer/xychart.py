@@ -30,11 +30,7 @@ def render_xychart(
     if not diagram.datasets:
         return Canvas(1, 1)
 
-    # Horizontal mode only applies to bar-only charts.
-    # Line charts always render vertically since they need a
-    # continuous axis to show trends.
-    has_line = any(ds.chart_type == "line" for ds in diagram.datasets)
-    if diagram.horizontal and not has_line:
+    if diagram.horizontal:
         return _render_horizontal(diagram, use_ascii=use_ascii)
     return _render_vertical(diagram, use_ascii=use_ascii, rounded=rounded)
 
@@ -42,6 +38,19 @@ def render_xychart(
 # ---------------------------------------------------------------------------
 # Vertical chart (default)
 # ---------------------------------------------------------------------------
+
+def _header_rows(title: str, axis_label: str) -> int:
+    """Rows above the chart area: title, the label of the vertical axis, spacer."""
+    if title:
+        return 2  # title, then the axis label or a blank spacer
+    return 1 if axis_label else 0
+
+
+def _draw_axis_header(canvas: Canvas, row: int, margin_l: int, label: str) -> None:
+    """Draw the vertical axis' label just above its tick labels."""
+    col = max(1, margin_l - display_width(label))
+    canvas.put_text(row, col, label, style="edge_label")
+
 
 def _render_vertical(diagram: XYChart, use_ascii: bool = False, rounded: bool = True) -> Canvas:
     bar_char = "#" if use_ascii else _BAR_CHAR
@@ -85,7 +94,7 @@ def _render_vertical(diagram: XYChart, use_ascii: bool = False, rounded: bool = 
     chart_w = n_points * (col_width + _BAR_GAP) - _BAR_GAP
     total_w = _MARGIN_L + 1 + chart_w + 2
 
-    title_lines = 2 if diagram.title else 0
+    title_lines = _header_rows(diagram.title, diagram.y_label)
     total_h = _CHART_H + 4
 
     canvas = Canvas(total_w + 1, total_h + title_lines + 1)
@@ -95,6 +104,8 @@ def _render_vertical(diagram: XYChart, use_ascii: bool = False, rounded: bool = 
     if diagram.title:
         title_x = _MARGIN_L + (chart_w - display_width(diagram.title)) // 2
         canvas.put_text(0, max(0, title_x), diagram.title, style="label")
+    if diagram.y_label:
+        _draw_axis_header(canvas, row_offset - 1, _MARGIN_L, diagram.y_label)
 
     # Y-axis labels
     n_ticks = 5
@@ -211,7 +222,7 @@ def _render_horizontal(diagram: XYChart, use_ascii: bool = False) -> Canvas:
     chart_h = n_points * (bar_height + row_gap) - row_gap
     chart_w = _CHART_W
 
-    title_lines = 2 if diagram.title else 0
+    title_lines = _header_rows(diagram.title, diagram.x_label)
     total_h = title_lines + chart_h + 3  # chart + axis + value labels
     total_w = margin_l + 1 + chart_w + 2
 
@@ -222,6 +233,9 @@ def _render_horizontal(diagram: XYChart, use_ascii: bool = False) -> Canvas:
     if diagram.title:
         title_x = margin_l + (chart_w - display_width(diagram.title)) // 2
         canvas.put_text(0, max(0, title_x), diagram.title, style="label")
+    # Categories run down the left side, so the x-axis label sits above them
+    if diagram.x_label:
+        _draw_axis_header(canvas, row_offset - 1, margin_l, diagram.x_label)
 
     # Y-axis (categories on the left)
     for r in range(row_offset, row_offset + chart_h + 1):
@@ -243,9 +257,10 @@ def _render_horizontal(diagram: XYChart, use_ascii: bool = False) -> Canvas:
         label_x = col - display_width(label) // 2
         canvas.put_text(axis_row + 1, max(0, label_x), label, style="edge_label")
 
-    if diagram.x_label:
-        lx = margin_l + 1 + (chart_w - display_width(diagram.x_label)) // 2
-        canvas.put_text(axis_row + 2, max(0, lx), diagram.x_label, style="edge_label")
+    # Values run along the bottom, so the y-axis label goes under the ticks
+    if diagram.y_label:
+        lx = margin_l + 1 + (chart_w - display_width(diagram.y_label)) // 2
+        canvas.put_text(axis_row + 2, max(0, lx), diagram.y_label, style="edge_label")
 
     # Draw datasets
     for ds in diagram.datasets:
@@ -261,9 +276,21 @@ def _render_horizontal(diagram: XYChart, use_ascii: bool = False) -> Canvas:
             canvas.put_text(row, max(0, label_x), cat, style="edge_label")
             # Don't draw tick on category rows; the axis │ is enough
 
-            for c in range(bar_w):
-                canvas.put(row, margin_l + 1 + c, bar_char, merge=False,
-                          style=f"section:{i % 8}")
+            if ds.chart_type == "bar":
+                for c in range(bar_w):
+                    canvas.put(row, margin_l + 1 + c, bar_char, merge=False,
+                              style=f"section:{i % 8}")
+                continue
+
+            # Line: mark the value on this category's row and join it to
+            # the previous point through the gap row in between.
+            point_x = margin_l + int((val - min_val) / val_range * (chart_w - 1))
+            canvas.put(row, point_x, vt, merge=False, style="edge")
+            if i > 0:
+                prev_val = ds.values[i - 1]
+                prev_x = margin_l + int((prev_val - min_val) / val_range * (chart_w - 1))
+                prev_row = row_offset + (i - 1) * (bar_height + row_gap)
+                _draw_line_h(canvas, prev_x, prev_row, point_x, row, use_ascii)
 
     return canvas
 

@@ -10,6 +10,7 @@ from collections import deque
 from ..model.classdiagram import ClassDef, ClassDiagram, Note, Relationship
 from .canvas import Canvas
 from .charset import ASCII, UNICODE, CharSet
+from .relation_tracks import assign_tracks
 from ..utils import display_width
 
 # ── layout constants ──────────────────────────────────────────────
@@ -211,7 +212,7 @@ def _compute_layout(
     diagram: ClassDiagram,
     padding_x: int = _CLASS_PAD,
     gap: int = _SIBLING_GAP,
-) -> tuple[dict[str, tuple[int, int]], dict[str, tuple[int, int]], int, int, dict[str, int]]:
+) -> tuple[dict[str, tuple[int, int]], dict[str, tuple[int, int]], int, int, dict[str, int], dict[int, int]]:
     """Compute positions and sizes for all classes.
 
     Returns (positions, sizes, canvas_width, canvas_height, layer_of).
@@ -221,7 +222,7 @@ def _compute_layout(
     """
     layers = _assign_layers(diagram)
     if not layers:
-        return {}, {}, 1, 1, {}
+        return {}, {}, 1, 1, {}, {}
 
     # Compute box sizes
     sizes: dict[str, tuple[int, int]] = {}
@@ -246,6 +247,7 @@ def _compute_layout(
             pair_gap[key] = max(pair_gap.get(key, gap), pair_g)
 
     is_lr = diagram.direction == "LR"
+    run_rows: dict[int, int] = {}
 
     if is_lr:
         # Layers are columns, classes stacked vertically
@@ -271,37 +273,56 @@ def _compute_layout(
         canvas_width = col_x - gap + _MARGIN
         canvas_height = max_height
     else:
-        # TB: Layers are rows, classes placed horizontally
+        # TB: layers are rows, boxes placed horizontally.
+        # Columns first, since they do not depend on the vertical gaps.
         positions = {}
-        row_y = _MARGIN
+        layer_heights: list[int] = []
         max_width = 0
 
         for layer in layers:
-            layer_height = max(sizes[n][1] for n in layer)
-
-            # Place classes with per-pair gaps
+            layer_heights.append(max(sizes[n][1] for n in layer))
             col_x = _MARGIN
             for idx, name in enumerate(layer):
-                w, h = sizes[name]
-                y_offset = (layer_height - h) // 2
-                positions[name] = (col_x, row_y + y_offset)
-                # Determine gap to next sibling
+                w, _ = sizes[name]
+                positions[name] = (col_x, 0)
                 if idx < len(layer) - 1:
                     next_name = layer[idx + 1]
                     key = (min(name, next_name), max(name, next_name))
-                    pair_g = pair_gap.get(key, gap)
-                    col_x += w + pair_g
+                    col_x += w + pair_gap.get(key, gap)
                 else:
                     col_x += w
-
             max_width = max(max_width, col_x + _MARGIN)
-            row_y += layer_height + gap
-
         canvas_width = max_width
-        canvas_height = row_y - gap + _MARGIN
 
-    # Center each layer
+        # Center each layer horizontally
+        for layer in layers:
+            min_x = min(positions[n][0] for n in layer)
+            max_x = max(positions[n][0] + sizes[n][0] for n in layer)
+            offset = (canvas_width - 2 * _MARGIN - (max_x - min_x)) // 2
+            if offset > 0:
+                for name in layer:
+                    positions[name] = (positions[name][0] + offset, 0)
+
+        # Rows: the gap below a layer grows to hold one track per relationship
+        # that jogs sideways inside it, so their runs never share a row.
+        tracks, gap_heights = _assign_gap_tracks(diagram, layer_of, positions, sizes)
+        layer_tops: list[int] = []
+        row_y = _MARGIN
+        for li, layer in enumerate(layers):
+            layer_tops.append(row_y)
+            layer_height = layer_heights[li]
+            for name in layer:
+                x, _ = positions[name]
+                _, h = sizes[name]
+                positions[name] = (x, row_y + (layer_height - h) // 2)
+            row_y += layer_height + max(gap, gap_heights.get(li, 0) + 2)
+        canvas_height = layer_tops[-1] + layer_heights[-1] + _MARGIN
+
+        for index, (boundary, offset) in tracks.items():
+            run_rows[index] = layer_tops[boundary] + layer_heights[boundary] + offset
+
     if is_lr:
+        # Center each column vertically
         for layer in layers:
             layer_h = sum(sizes[n][1] for n in layer) + gap * (len(layer) - 1)
             offset = (canvas_height - 2 * _MARGIN - layer_h) // 2
@@ -309,16 +330,65 @@ def _compute_layout(
                 for name in layer:
                     x, y = positions[name]
                     positions[name] = (x, y + offset)
-    else:
-        for layer in layers:
-            layer_w = sum(sizes[n][0] for n in layer) + gap * (len(layer) - 1)
-            offset = (canvas_width - 2 * _MARGIN - layer_w) // 2
-            if offset > 0:
-                for name in layer:
-                    x, y = positions[name]
-                    positions[name] = (x + offset, y)
 
-    return positions, sizes, canvas_width, canvas_height, layer_of
+    return positions, sizes, canvas_width, canvas_height, layer_of, run_rows
+
+
+def _assign_gap_tracks(
+    diagram: ClassDiagram,
+    layer_of: dict[str, int],
+    positions: dict[str, tuple[int, int]],
+    sizes: dict[str, tuple[int, int]],
+) -> tuple[dict[int, tuple[int, int]], dict[int, int]]:
+    """Give every sideways run between adjacent layers its own row.
+
+    Returns ({rel_index: (upper_layer_index, row_offset)}, {layer: rows}):
+    the offset counts rows below the upper layer's bottom border, and the
+    second map says how many rows each gap needs for its runs. A run whose
+    label does not fit between its corners gets a second row so the label
+    can hang below it. Runs that skip a layer or drop straight down keep the
+    default routing and are not listed.
+    """
+    exit_offsets = _compute_exit_offsets(diagram, layer_of)
+    entry_offsets = _compute_exit_offsets(diagram, layer_of, end="target")
+    intervals: dict[int, dict[int, tuple[int, int]]] = {}
+    hanging: dict[int, bool] = {}
+    for i, rel in enumerate(diagram.relationships):
+        src, tgt = rel.source, rel.target
+        if src not in positions or tgt not in positions:
+            continue
+        ls, lt = layer_of.get(src, -1), layer_of.get(tgt, -2)
+        if abs(ls - lt) != 1:
+            continue
+        start_col = positions[src][0] + sizes[src][0] // 2 + int(exit_offsets.get(i, 0))
+        end_col = positions[tgt][0] + sizes[tgt][0] // 2 + int(entry_offsets.get(i, 0))
+        if start_col == end_col:
+            continue
+        boundary = min(ls, lt)
+        left, right = min(start_col, end_col), max(start_col, end_col)
+        label_width = display_width(rel.label) if rel.label else 0
+        hanging[i] = bool(label_width) and right - left - 2 < label_width
+        if hanging[i]:
+            # The label will hang below the run, to the right of the drop
+            # into the target; keep that span clear on the same track too.
+            right = max(right, end_col + 2 + label_width)
+        intervals.setdefault(boundary, {})[i] = (left, right)
+
+    rows: dict[int, tuple[int, int]] = {}
+    gap_heights: dict[int, int] = {}
+    for boundary, runs in intervals.items():
+        tracks = assign_tracks(runs)
+        heights = [1] * (max(tracks.values()) + 1)
+        for index, track in tracks.items():
+            if hanging[index]:
+                heights[track] = 2
+        offsets = [1]
+        for height in heights:
+            offsets.append(offsets[-1] + height)
+        for index, track in tracks.items():
+            rows[index] = (boundary, offsets[track])
+        gap_heights[boundary] = offsets[-1] - 1
+    return rows, gap_heights
 
 
 def _draw_routed_line(
@@ -326,6 +396,7 @@ def _draw_routed_line(
     r1: int, c1: int, r2: int, c2: int,
     h_char: str, v_char: str, use_ascii: bool,
     style: str = "edge",
+    mid_row: int | None = None,
 ) -> None:
     """Draw a routed line from (r1,c1) to (r2,c2).
 
@@ -343,7 +414,8 @@ def _draw_routed_line(
             canvas.put(r1, c, h_char, style=style)
     else:
         # Z-shaped: vertical from start to midpoint row, horizontal, vertical to end
-        mid_row = (r1 + r2) // 2
+        if mid_row is None:
+            mid_row = (r1 + r2) // 2
 
         # Vertical: start → mid
         for r in range(min(r1, mid_row), max(r1, mid_row) + 1):
@@ -408,9 +480,20 @@ def _draw_relationship(
     cs: CharSet,
     use_ascii: bool,
     src_col_offset: int = 0,
+    tgt_col_offset: int = 0,
     is_lr: bool = False,
+    row_offset: int = 0,
+    phase: str = "all",
+    run_row: int | None = None,
 ) -> None:
-    """Draw a relationship line between two classes."""
+    """Draw a relationship line between two classes.
+
+    ``phase`` selects what to draw: "lines" draws the connector and its end
+    markers so every line is on the canvas before any text, "text" draws the
+    label and cardinalities on top, "all" does both. ``row_offset`` shifts a
+    horizontal line so several relationships between the same pair of
+    classes do not overlap.
+    """
     if rel.source not in positions or rel.target not in positions:
         return
 
@@ -442,86 +525,114 @@ def _draw_relationship(
     # src_dir = direction pointing TOWARD source (for source marker)
     # tgt_dir = direction pointing TOWARD target (for target marker)
     if not use_horizontal:
-        # Vertical connection
+        start_col = s_cx + src_col_offset
+        end_col = t_cx + tgt_col_offset
         if dy > 0:
-            start_col = s_cx + src_col_offset
             start_row = sy + sh  # bottom of source
-            end_col = t_cx
             end_row = ty - 1     # top of target
             src_dir = "up"       # marker points back toward source (up)
             tgt_dir = "down"     # marker points toward target (down)
         else:
-            start_col = s_cx + src_col_offset
             start_row = sy - 1   # top of source
-            end_col = t_cx
             end_row = ty + th    # bottom of target
             src_dir = "down"
             tgt_dir = "up"
     else:
-        # Horizontal connection
         if dx > 0:
             start_col = sx + sw  # right of source
-            start_row = s_cy
             end_col = tx - 1     # left of target
-            end_row = t_cy
             src_dir = "left"     # marker points back toward source (left)
             tgt_dir = "right"    # marker points toward target (right)
         else:
             start_col = sx - 1   # left of source
-            start_row = s_cy
             end_col = tx + tw    # right of target
-            end_row = t_cy
             src_dir = "right"
             tgt_dir = "left"
+        start_row = s_cy
+        end_row = t_cy
+        if same_layer:
+            # Side-by-side boxes: one straight line at a row both boxes share,
+            # nudged by row_offset when the pair has several relationships.
+            lo = max(sy + 1, ty + 1)
+            hi = min(sy + sh - 2, ty + th - 2)
+            if lo <= hi:
+                row = (s_cy + t_cy) // 2 + row_offset
+                start_row = end_row = min(max(row, lo), hi)
 
     h_char = cs.line_dotted_h if rel.line_style == "dashed" else cs.line_horizontal
     v_char = cs.line_dotted_v if rel.line_style == "dashed" else cs.line_vertical
     style = "edge"
 
-    _draw_routed_line(canvas, start_row, start_col, end_row, end_col,
-                      h_char, v_char, use_ascii, style)
+    if phase in ("all", "lines"):
+        _draw_routed_line(canvas, start_row, start_col, end_row, end_col,
+                          h_char, v_char, use_ascii, style, mid_row=run_row)
 
-    # Draw markers at endpoints
-    if not use_ascii:
-        src_marker_ch = _marker_char(rel.source_marker, src_dir)
-        tgt_marker_ch = _marker_char(rel.target_marker, tgt_dir)
-        if src_marker_ch:
-            canvas.put(start_row, start_col, src_marker_ch, merge=False, style="arrow")
-        if tgt_marker_ch:
-            canvas.put(end_row, end_col, tgt_marker_ch, merge=False, style="arrow")
-    else:
-        # ASCII markers
-        if rel.source_marker in ("<|", "<"):
-            canvas.put(start_row, start_col, "<", merge=False, style="arrow")
-        elif rel.source_marker in ("*", "o"):
-            canvas.put(start_row, start_col, rel.source_marker, merge=False, style="arrow")
-        if rel.target_marker in ("|>", ">"):
-            canvas.put(end_row, end_col, ">", merge=False, style="arrow")
-        elif rel.target_marker in ("*", "o"):
-            canvas.put(end_row, end_col, rel.target_marker, merge=False, style="arrow")
+        # Draw markers at endpoints
+        if not use_ascii:
+            src_marker_ch = _marker_char(rel.source_marker, src_dir)
+            tgt_marker_ch = _marker_char(rel.target_marker, tgt_dir)
+            if src_marker_ch:
+                canvas.put(start_row, start_col, src_marker_ch, merge=False, style="arrow")
+            if tgt_marker_ch:
+                canvas.put(end_row, end_col, tgt_marker_ch, merge=False, style="arrow")
+        else:
+            # ASCII markers
+            if rel.source_marker in ("<|", "<"):
+                canvas.put(start_row, start_col, "<", merge=False, style="arrow")
+            elif rel.source_marker in ("*", "o"):
+                canvas.put(start_row, start_col, rel.source_marker, merge=False, style="arrow")
+            if rel.target_marker in ("|>", ">"):
+                canvas.put(end_row, end_col, ">", merge=False, style="arrow")
+            elif rel.target_marker in ("*", "o"):
+                canvas.put(end_row, end_col, rel.target_marker, merge=False, style="arrow")
+    if phase == "lines":
+        return
 
-    # Draw label at midpoint
+    left_col = min(start_col, end_col)
+    right_col = max(start_col, end_col)
+    mid_r = run_row if run_row is not None else (start_row + end_row) // 2
+
+    # Draw label
     if rel.label:
-        mid_r = (start_row + end_row) // 2
-        mid_c = (start_col + end_col) // 2
+        label_w = display_width(rel.label)
         if start_row == end_row:
             # Horizontal: label above the line
-            label_col = mid_c - display_width(rel.label) // 2
-            canvas.put_text(mid_r - 1, label_col, rel.label, style="edge_label")
+            mid_c = (start_col + end_col) // 2
+            canvas.put_text(mid_r - 1, mid_c - label_w // 2, rel.label, style="edge_label")
+        elif start_col == end_col:
+            # Straight vertical: label to the right of the midpoint
+            canvas.put_text(mid_r, start_col + 2, rel.label, style="edge_label")
+        elif use_horizontal:
+            # LR mode Z-route: label beside the vertical run
+            canvas.put_text(mid_r, (start_col + end_col) // 2 + 2, rel.label, style="edge_label")
+        elif right_col - left_col - 2 >= label_w:
+            # Z-route: the label rides on the horizontal run between the corners
+            canvas.put_text(mid_r, left_col + 2, rel.label, style="edge_label")
         else:
-            # Vertical or L-shaped: label to the right of midpoint
-            canvas.put_text(mid_r, mid_c + 2, rel.label, style="edge_label")
+            # Too short a run: hang the label off the drop into the target, on
+            # the row the track reserved below the run
+            canvas.put_text(mid_r + 1, end_col + 2, rel.label, style="edge_label")
 
     # Draw cardinality near endpoints
-    if rel.source_card:
-        canvas.put_text(start_row, start_col + 1, rel.source_card, style="edge_label")
-    if rel.target_card:
-        canvas.put_text(end_row, end_col + 1, rel.target_card, style="edge_label")
+    if use_horizontal and start_row == end_row:
+        # Below the line at each end, so it never collides with the label above
+        if rel.source_card:
+            col = start_col + 1 if start_col < end_col else start_col - display_width(rel.source_card)
+            canvas.put_text(start_row + 1, col, rel.source_card, style="edge_label")
+        if rel.target_card:
+            col = end_col - display_width(rel.target_card) if start_col < end_col else end_col + 1
+            canvas.put_text(end_row + 1, col, rel.target_card, style="edge_label")
+    else:
+        if rel.source_card:
+            canvas.put_text(start_row, start_col + 1, rel.source_card, style="edge_label")
+        if rel.target_card:
+            canvas.put_text(end_row, end_col + 1, rel.target_card, style="edge_label")
 
 
 def _compute_exit_offsets(
     diagram: ClassDiagram,
     layer_of: dict[str, int],
+    end: str = "source",
 ) -> dict[int, int]:
     """Compute horizontal offset for each relationship's exit point.
 
@@ -540,7 +651,7 @@ def _compute_exit_offsets(
             side = "side"
         else:
             side = "bottom"
-        key = (rel.source, side)
+        key = (rel.source if end == "source" else rel.target, side)
         groups.setdefault(key, []).append(i)
 
     offsets: dict[int, int] = {}
@@ -551,8 +662,36 @@ def _compute_exit_offsets(
             continue
         # Spread offsets symmetrically around center
         n = len(indices)
+        # Leave room for a cardinality beside each line
+        widest = max(len((diagram.relationships[idx].source_card if end == "source" else diagram.relationships[idx].target_card) or "") for idx in indices)
+        spacing = max(4, widest + 2)
         for j, idx in enumerate(indices):
-            offsets[idx] = (j - (n - 1) / 2) * 3
+            offsets[idx] = (j - (n - 1) / 2) * spacing
+    return offsets
+
+
+def _compute_row_offsets(
+    diagram: ClassDiagram,
+    layer_of: dict[str, int],
+) -> dict[int, int]:
+    """Spread horizontal lines between the same two classes over separate rows.
+
+    Two classes side by side can be linked both ways (``A --> B`` and
+    ``B ..> A``); without an offset both lines land on the same row and the
+    second erases the first. Returns {rel_index: row_offset}.
+    """
+    groups: dict[tuple[str, str], list[int]] = {}
+    for i, rel in enumerate(diagram.relationships):
+        if layer_of.get(rel.source, -1) != layer_of.get(rel.target, -2):
+            continue
+        key = (min(rel.source, rel.target), max(rel.source, rel.target))
+        groups.setdefault(key, []).append(i)
+
+    offsets: dict[int, int] = {}
+    for indices in groups.values():
+        n = len(indices)
+        for j, idx in enumerate(indices):
+            offsets[idx] = round((j - (n - 1) / 2) * 2)
     return offsets
 
 
@@ -682,7 +821,7 @@ def render_class_diagram(diagram: ClassDiagram, *, use_ascii: bool = False, padd
     """Render a ClassDiagram to a Canvas."""
     cs = ASCII if use_ascii else UNICODE
 
-    positions, sizes, width, height, layer_of = _compute_layout(diagram, padding_x=padding_x, gap=gap)
+    positions, sizes, width, height, layer_of, run_rows = _compute_layout(diagram, padding_x=padding_x, gap=gap)
     if width <= 1 and not diagram.notes:
         return Canvas(1, 1)
 
@@ -703,14 +842,22 @@ def render_class_diagram(diagram: ClassDiagram, *, use_ascii: bool = False, padd
         width = max(width, label_end + _MARGIN)
 
     exit_offsets = _compute_exit_offsets(diagram, layer_of)
+    entry_offsets = _compute_exit_offsets(diagram, layer_of, end="target")
 
     canvas = Canvas(width, height)
 
-    # Draw relationships first (background)
-    for i, rel in enumerate(diagram.relationships):
-        col_offset = int(exit_offsets.get(i, 0))
-        _draw_relationship(canvas, rel, positions, sizes, layer_of, cs, use_ascii,
-                           src_col_offset=col_offset, is_lr=diagram.direction == "LR")
+    # Draw every relationship line first, then their text, so a later line
+    # never overwrites an earlier label or cardinality
+    row_offsets = _compute_row_offsets(diagram, layer_of)
+    is_lr = diagram.direction == "LR"
+    for phase in ("lines", "text"):
+        for i, rel in enumerate(diagram.relationships):
+            col_offset = int(exit_offsets.get(i, 0))
+            entry_offset = int(entry_offsets.get(i, 0))
+            _draw_relationship(canvas, rel, positions, sizes, layer_of, cs, use_ascii,
+                               src_col_offset=col_offset, tgt_col_offset=entry_offset, is_lr=is_lr,
+                               row_offset=row_offsets.get(i, 0), phase=phase,
+                               run_row=run_rows.get(i))
 
     # Draw class boxes on top
     for name, cls in diagram.classes.items():

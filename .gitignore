@@ -19,3 +19,6 @@ demo/.DS_Store
 *.txt
 screenshot.png
 .plans/
+
+# Snapshot expectations are tracked even though *.txt is ignored above
+!tests/fixtures/expected/**/*.txt

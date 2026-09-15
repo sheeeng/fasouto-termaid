@@ -45,8 +45,9 @@ def expand_subgraph_edges(graph: Graph) -> list[Edge]:
             # Empty subgraph, self-edge, or nested endpoints: the
             # constraint is unsatisfiable, so skip it.
             continue
-        for s in sources:
-            for t in targets:
+        order = {nid: i for i, nid in enumerate(graph.node_order)}
+        for s in sorted(sources, key=lambda n: order.get(n, 0)):
+            for t in sorted(targets, key=lambda n: order.get(n, 0)):
                 virtual.append(Edge(source=s, target=t, min_length=e.min_length))
     return virtual
 
@@ -69,7 +70,9 @@ def assign_layers(graph: Graph) -> dict[str, int]:
     # BFS ensures each node is discovered at the shallowest depth,
     # so edges like F->D (where D is also reachable from B at a
     # shallower level) are correctly treated as back/cross-edges.
-    tree_edges: set[tuple[str, str]] = set()
+    # A list, not a set: the loop below inserts into `layers` in discovery
+    # order, and later stages must not depend on hash order.
+    tree_edges: list[tuple[str, str]] = []
     visited: set[str] = set()
 
     queue: deque[str] = deque()
@@ -83,7 +86,7 @@ def assign_layers(graph: Graph) -> dict[str, int]:
         for child in graph.get_children(node):
             if child not in visited:
                 visited.add(child)
-                tree_edges.add((node, child))
+                tree_edges.append((node, child))
                 queue.append(child)
 
     # Also BFS from any unvisited nodes (disconnected components)
@@ -96,7 +99,7 @@ def assign_layers(graph: Graph) -> dict[str, int]:
                 for child in graph.get_children(node):
                     if child not in visited:
                         visited.add(child)
-                        tree_edges.add((node, child))
+                        tree_edges.append((node, child))
                         queue.append(child)
 
     # Build edge min_length lookup
@@ -213,8 +216,17 @@ def separate_subgraph_layers(graph: Graph, layers: dict[str, int]) -> dict[str, 
     if len(sg_ranges) < 2:
         return layers
 
-    # Check for overlapping ranges between different subgraphs
-    sg_ids = list(sg_ranges.keys())
+    # Check for overlapping ranges between different subgraphs.
+    # Declaration order, so sibling subgraphs stack the way they were written.
+    sg_ids: list[str] = []
+
+    def _declared(subs: list[Subgraph]) -> None:
+        for sg in subs:
+            if sg.id in sg_ranges:
+                sg_ids.append(sg.id)
+            _declared(sg.children)
+
+    _declared(graph.subgraphs)
     has_overlap = False
     for i in range(len(sg_ids)):
         for j in range(i + 1, len(sg_ids)):
@@ -230,14 +242,16 @@ def separate_subgraph_layers(graph: Graph, layers: dict[str, int]) -> dict[str, 
         return layers
 
     # Build subgraph DAG from cross-boundary edges
-    sg_succs: dict[str, set[str]] = {sid: set() for sid in sg_ids}
+    # Lists, not sets: the topological order below must not depend on hash
+    # order or sibling subgraphs would swap places between runs.
+    sg_succs: dict[str, list[str]] = {sid: [] for sid in sg_ids}
     sg_in_deg: dict[str, int] = {sid: 0 for sid in sg_ids}
     for e in graph.edges:
         s_sg = node_sg.get(e.source)
         t_sg = node_sg.get(e.target)
         if s_sg and t_sg and s_sg != t_sg and s_sg in sg_succs:
             if t_sg not in sg_succs[s_sg]:
-                sg_succs[s_sg].add(t_sg)
+                sg_succs[s_sg].append(t_sg)
                 sg_in_deg[t_sg] += 1
 
     # Topological sort (Kahn's)
@@ -258,16 +272,17 @@ def separate_subgraph_layers(graph: Graph, layers: dict[str, int]) -> dict[str, 
     sg_internal: dict[str, dict[str, int]] = {}
     sg_sizes: dict[str, int] = {}
     for sg_id in topo:
-        sg_nodes = {nid for nid, sid in node_sg.items() if sid == sg_id}
+        sg_nodes = [nid for nid in graph.node_order if node_sg.get(nid) == sg_id]
+        sg_member = set(sg_nodes)
         int_edges = [e for e in graph.edges
-                     if e.source in sg_nodes and e.target in sg_nodes
+                     if e.source in sg_member and e.target in sg_member
                      and not e.is_self_reference]
 
         # Internal roots: nodes with no incoming internal edge
         int_targets = {e.target for e in int_edges}
         int_roots = [nid for nid in sg_nodes if nid not in int_targets]
         if not int_roots:
-            int_roots = list(sg_nodes)[:1]
+            int_roots = sg_nodes[:1]
 
         int_layers: dict[str, int] = {r: 0 for r in int_roots}
         changed = True

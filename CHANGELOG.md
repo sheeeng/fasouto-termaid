@@ -2,8 +2,21 @@
 
 ## Unreleased
 
+### New
+- XY charts: the y-axis title is drawn (above the ticks in vertical charts, under the value axis in horizontal ones), and horizontal charts now render line series instead of falling back to vertical
+
+### Behavior changes
+- Sequence: block frames (alt, loop, par, ...) span only the participants they involve, matching Mermaid, instead of every lifeline
+- Class and ER diagrams: several relationships leaving or entering the same box are spread further apart, and lines that jog sideways between layers each get their own row, so the gap between layers grows with the number of crossings
+
 ### Fixes
 - Sequence scope frames now enclose their messages, notes, branches, and nested frames. Deep nesting no longer crosses message arrows, and long scope titles remain inside their borders.
+- Sequence: else/and section labels keep their spaces instead of being drawn with dashes
+- Flowchart: open links with a label (`A ---|text| B`) no longer get an arrowhead
+- Flowchart: `A -- text --> B` is a normal-length link again; the leading dashes were being counted as extra length, which stretched the layout
+- Flowchart: sibling subgraphs kept the same order between runs only by luck (hash order); layout is now deterministic
+- State diagrams: transitions to or from a composite state attach to its border instead of drawing a duplicate plain state next to it
+- Class and ER diagrams: relationship labels and cardinalities are drawn after all lines, so a later line no longer erases them; side-by-side boxes are joined with a straight line instead of a kinked one; two relationships between the same pair of classes get separate rows instead of overwriting each other; cardinalities no longer land on a box border
 
 ## 0.8.0 (2026-07-29)
 

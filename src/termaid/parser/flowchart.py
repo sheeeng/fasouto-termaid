@@ -681,7 +681,7 @@ class _FlowchartParser:
             label = m.group(5).strip()
             # Parse the arrow part (everything before the first |)
             arrow_part = text[m.start():m.start() + m.group(0).index("|")]
-            style, arr_start, arr_end, type_start, type_end = self._classify_arrow(arrow_part + ">")
+            style, arr_start, arr_end, type_start, type_end = self._classify_arrow(arrow_part)
             length = _compute_arrow_length(arrow_part, style)
             return (m.start(), m.end(), style, arr_start, arr_end, label, length, type_start, type_end)
 
@@ -695,8 +695,9 @@ class _FlowchartParser:
             m = re.search(pat, text)
             if m:
                 label_text = m.group(2).strip()
-                arrow_portion = m.group(1) + m.group(3)
-                length = _compute_arrow_length(arrow_portion, style)
+                # Only the trailing arrow carries the length: `-- text -->` is a
+                # normal link, `-- text --->` is one step longer.
+                length = _compute_arrow_length(m.group(3), style)
                 return (m.start(), m.end(), style, arr_start, arr_end, label_text, length, ArrowType.ARROW, ArrowType.ARROW)
 
         return None

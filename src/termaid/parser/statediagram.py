@@ -45,6 +45,7 @@ class _StateDiagramParser:
         for line in lines:
             self._parse_line(line)
 
+        self._resolve_composite_edges()
         return self.graph
 
     def _preprocess(self, text: str) -> list[str]:
@@ -163,6 +164,44 @@ class _StateDiagramParser:
             state_id = line.strip()
             if state_id not in self.graph.nodes:
                 self._ensure_node(state_id, state_id, NodeShape.ROUNDED)
+
+    def _resolve_composite_edges(self) -> None:
+        """Point transitions at composite states to the subgraph itself.
+
+        A transition like `Idle --> Processing` may be parsed before or after
+        `state Processing { ... }`, so `_resolve_state` creates a plain node for
+        it. Once parsing is done, swap those nodes for the subgraph so the edge
+        attaches to the composite's border instead of a duplicate box.
+        """
+        sg_ids: set[str] = set()
+        all_subgraphs: list[Subgraph] = []
+
+        def _collect(subs: list[Subgraph]) -> None:
+            for sg in subs:
+                sg_ids.add(sg.id)
+                all_subgraphs.append(sg)
+                _collect(sg.children)
+
+        _collect(self.graph.subgraphs)
+        if not sg_ids:
+            return
+
+        to_remove: set[str] = set()
+        for edge in self.graph.edges:
+            if edge.source in sg_ids:
+                edge.source_is_subgraph = True
+                to_remove.add(edge.source)
+            if edge.target in sg_ids:
+                edge.target_is_subgraph = True
+                to_remove.add(edge.target)
+
+        for nid in to_remove:
+            self.graph.nodes.pop(nid, None)
+            if nid in self.graph.node_order:
+                self.graph.node_order.remove(nid)
+            for sg in all_subgraphs:
+                if nid in sg.node_ids:
+                    sg.node_ids.remove(nid)
 
     def _resolve_state(self, raw: str, is_source: bool) -> str:
         """Resolve [*] to start/end nodes, or ensure a regular state exists."""
