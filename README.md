@@ -22,10 +22,18 @@
 
 Mermaid is great for documentation, but rendering it usually means spinning up a browser or calling an external service. termaid lets you render diagrams over SSH, in CI logs, inside TUI apps, or anywhere you have a Python environment. It was built because the existing tools in this space, like [mermaid-ascii](https://github.com/AlexanderGrooff/mermaid-ascii) (Go) and [beautiful-mermaid](https://github.com/lukilabs/beautiful-mermaid) (TypeScript), don't offer a native Python library you can import and call directly.
 
-## Install
+## Install it using your package manager:
+
+### Pip
 
 ```bash
 pip install termaid
+```
+
+### Homebrew
+
+```bash
+brew install termaid
 ```
 
 Or try it without installing:
